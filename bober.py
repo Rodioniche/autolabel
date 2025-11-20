@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from scipy import ndimage
 import math
 from matplotlib.path import Path
-
+#ггйода гойдав
 
 def find_equals(src_points, dst_points):
     """
