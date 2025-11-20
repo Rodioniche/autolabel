@@ -550,8 +550,8 @@ class PCBCornerDetector:
 
 def main():
     # Загрузка изображений
-    reference_img = Image.open('chess.jpg')
-    test_img = Image.open('chessboard_3_3.jpg')
+    reference_img = Image.open('photoetalon.jpg')
+    test_img = Image.open('photoschakal.jpg')
 
     reference_array = np.array(reference_img)
     test_array = np.array(test_img)
