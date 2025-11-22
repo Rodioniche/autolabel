@@ -1,17 +1,17 @@
 import dataclasses
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 from scipy import ndimage as ndi
-from matplotlib.path import Path as MplPath
+
 try:
-    from skimage import color, exposure, feature, transform  # type: ignore[import]
-    from skimage.measure import ransac  # type: ignore[import]
-except ImportError as exc:  # pragma: no cover
-    raise ImportError("Требуется пакет scikit-image: pip install scikit-image") from exc
+    from skimage import color, filters, measure, morphology
+    from skimage.filters import threshold_otsu
+except ImportError:
+    raise ImportError("Требуется scikit-image: pip install scikit-image")
 
 Array = np.ndarray
 
@@ -69,214 +69,280 @@ def match_histogram(reference: Array, test: Array, mask: Array | None = None, bi
     return np.clip(matched, 0.0, 1.0)
 
 
-def find_equals(src_points: Array, dst_points: Array) -> Array:
+def find_board_corners(
+    image: Array,
+    tolerance: float = 2.5,
+    gaussian_sigma: float = 1.0,
+    closing_radius: int = 3,
+    hole_area_threshold: int = 5000,
+    debug: bool = False,
+) -> Optional[np.ndarray]:
+    """
+    Находит углы платы на изображении.
+    
+    Parameters:
+    -----------
+    image : Array
+        Изображение в формате [0, 1], RGB или grayscale
+    tolerance : float
+        Точность аппроксимации многоугольника (меньше = больше точек)
+    gaussian_sigma : float
+        Сигма для размытия перед бинаризацией
+    closing_radius : int
+        Радиус диска для морфологического закрытия
+    hole_area_threshold : int
+        Минимальная площадь дырки для удаления
+    debug : bool
+        Показывать промежуточные результаты
+    
+    Returns:
+    --------
+    Optional[np.ndarray]
+        Массив углов формы (N, 2) с координатами (y, x), или None если не найдено
+    """
+    # Конвертируем в uint8 для skimage (если нужно)
+    if image.max() <= 1.0:
+        image_uint8 = (np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8)
+    else:
+        image_uint8 = np.clip(image, 0, 255).astype(np.uint8)
+    
+    # RGB -> grayscale через skimage
+    if image_uint8.ndim == 3:
+        gray = color.rgb2gray(image_uint8)
+    else:
+        gray = image_uint8.astype(np.float64) / 255.0
+    
+    # Размытие
+    blurred = filters.gaussian(gray, sigma=gaussian_sigma)
+    
+    # Бинаризация Otsu
+    thresh = threshold_otsu(blurred)
+    
+    # Определение фона по углу изображения
+    if blurred[0, 0] > thresh:
+        binary = blurred < thresh
+    else:
+        binary = blurred > thresh
+    
+    # Морфология: закрытие разрывов
+    selem = morphology.disk(closing_radius)
+    closed_mask = morphology.binary_closing(binary, selem)
+    
+    # Удаление маленьких дырок внутри платы
+    final_mask = morphology.remove_small_holes(closed_mask, area_threshold=hole_area_threshold)
+    
+    # Поиск контуров
+    contours = measure.find_contours(final_mask, level=0.5)
+    
+    if not contours:
+        print("[!] Контуры платы не найдены")
+        return None
+    
+    # Самый длинный контур - внешняя граница
+    main_contour = max(contours, key=lambda x: len(x))
+    
+    # Аппроксимация многоугольника
+    poly_approx = measure.approximate_polygon(main_contour, tolerance=tolerance)
+    
+    # Убираем последнюю точку (она дублирует первую)
+    all_corners = poly_approx[:-1] if len(poly_approx) > 1 else poly_approx
+    
+    # Находим 4 крайних угла
+    if len(all_corners) >= 4:
+        # Находим центр масс всех точек
+        center = all_corners.mean(axis=0)
+        
+        # Вычисляем векторы от центра
+        vectors = all_corners - center
+        
+        # Находим 4 крайние точки в направлениях: верх-левый, верх-правый, низ-правый, низ-левый
+        # Используем комбинации координат для определения квадрантов
+        
+        # Верх-левый: минимальная y, минимальная x (относительно центра)
+        top_left_idx = np.argmin(vectors[:, 0] + vectors[:, 1])  # Минимум суммы
+        
+        # Верх-правый: минимальная y, максимальная x
+        top_right_idx = np.argmin(vectors[:, 0] - vectors[:, 1])  # Минимум y, максимум x
+        
+        # Низ-правый: максимальная y, максимальная x
+        bottom_right_idx = np.argmax(vectors[:, 0] + vectors[:, 1])  # Максимум суммы
+        
+        # Низ-левый: максимальная y, минимальная x
+        bottom_left_idx = np.argmax(vectors[:, 0] - vectors[:, 1])  # Максимум y, минимум x
+        
+        corners = np.array([
+            all_corners[top_left_idx],
+            all_corners[top_right_idx],
+            all_corners[bottom_right_idx],
+            all_corners[bottom_left_idx],
+        ])
+        print(f"[i] Найдено {len(all_corners)} точек контура, выбрано 4 крайних угла")
+    elif len(all_corners) > 0:
+        # Если меньше 4 точек, используем то что есть
+        corners = all_corners
+        print(f"[!] Найдено только {len(all_corners)} углов (нужно 4)")
+    else:
+        print("[!] Углы не найдены")
+        return None
+    
+    if debug:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+        
+        axes[0].imshow(final_mask, cmap='gray')
+        axes[0].set_title("Маска платы")
+        axes[0].axis('off')
+        
+        # Показываем исходное изображение
+        if image_uint8.ndim == 3:
+            axes[1].imshow(image_uint8)
+        else:
+            axes[1].imshow(image_uint8, cmap='gray')
+        axes[1].set_title(f"Углы платы (tolerance={tolerance})")
+        axes[1].axis('off')
+        
+        # Рисуем контур
+        if len(poly_approx) > 1:
+            axes[1].plot(poly_approx[:, 1], poly_approx[:, 0], linewidth=2, color='#00FF00')
+        
+        # Рисуем углы
+        if len(corners) > 0:
+            axes[1].scatter(corners[:, 1], corners[:, 0], c='red', s=100, zorder=5)
+            
+            # Номера углов
+            for i, (y, x) in enumerate(corners):
+                axes[1].text(x + 5, y - 5, str(i), color='yellow', fontsize=12, weight='bold',
+                            bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+        
+        plt.tight_layout()
+        plt.show()
+    
+    return corners
+
+
+def compute_homography(src_points: np.ndarray, dst_points: np.ndarray) -> np.ndarray:
     """
     Вычисляет матрицу гомографии H (3x3) из соответствий точек.
+    
+    Parameters:
+    -----------
+    src_points : np.ndarray
+        Исходные точки формы (N, 2) с координатами (y, x)
+    dst_points : np.ndarray
+        Целевые точки формы (N, 2) с координатами (y, x)
+    
+    Returns:
+    --------
+    np.ndarray
+        Матрица гомографии 3x3
     """
-    if len(src_points) < 4 or len(dst_points) < 4:
-        raise ValueError("Нужно минимум 4 точки для вычисления гомографии")
-    if len(src_points) != len(dst_points):
-        raise ValueError("Количество исходных и целевых точек должно совпадать")
-
+    if len(src_points) != 4 or len(dst_points) != 4:
+        raise ValueError("Нужно по 4 точки для вычисления гомографии")
+    
+    # Конвертируем (y, x) в (x, y) для гомографии
+    src_xy = np.array([[p[1], p[0]] for p in src_points], dtype=np.float64)
+    dst_xy = np.array([[p[1], p[0]] for p in dst_points], dtype=np.float64)
+    
     A = []
-    for (x, y), (x_prime, y_prime) in zip(src_points, dst_points):
-        A.append([x, y, 1, 0, 0, 0, -x_prime * x, -x_prime * y, -x_prime])
-        A.append([0, 0, 0, x, y, 1, -y_prime * x, -y_prime * y, -y_prime])
+    for (x, y), (u, v) in zip(src_xy, dst_xy):
+        A.append([x, y, 1, 0, 0, 0, -u * x, -u * y, -u])
+        A.append([0, 0, 0, x, y, 1, -v * x, -v * y, -v])
     A = np.asarray(A, dtype=np.float64)
-
-    _, _, Vt = np.linalg.svd(A)
-    H = Vt[-1].reshape(3, 3)
+    
+    _, _, vt = np.linalg.svd(A)
+    H = vt[-1].reshape(3, 3)
     H = H / H[2, 2]
     return H
 
 
-def extract_pcb_region(image: Array, corners: List[Tuple[float, float]], padding: int = 5
-                       ) -> Tuple[Array, Tuple[int, int, int, int], Array]:
+def warp_with_homography(image: Array, H: np.ndarray, output_shape: Tuple[int, int]) -> Array:
     """
-    Вырезает область платы внутри указанных углов, дополнительно расширяя маску padding-пикселями.
+    Преобразует изображение через гомографию H в output_shape.
+    
+    Parameters:
+    -----------
+    image : Array
+        Исходное изображение
+    H : np.ndarray
+        Матрица гомографии 3x3
+    output_shape : Tuple[int, int]
+        Размер выходного изображения (height, width)
+    
+    Returns:
+    --------
+    Array
+        Преобразованное изображение
     """
-    if not corners or len(corners) < 4:
-        h, w = image.shape[:2]
-        return image.copy(), (0, 0, w, h), np.ones((h, w), dtype=bool)
-
-    h, w = image.shape[:2]
-    poly_path = MplPath(corners)
-    y_grid, x_grid = np.mgrid[0:h, 0:w]
-    coords = np.vstack((x_grid.ravel(), y_grid.ravel())).T
-    mask = poly_path.contains_points(coords).reshape(h, w)
-
-    if padding > 0:
-        mask = ndi.binary_dilation(mask, iterations=padding)
-
-    ys, xs = np.where(mask)
-    if len(ys) == 0:
-        return image.copy(), (0, 0, w, h), mask
-
-    min_y = max(0, ys.min())
-    max_y = min(h, ys.max() + 1)
-    min_x = max(0, xs.min())
-    max_x = min(w, xs.max() + 1)
-
-    clipped_mask = mask[min_y:max_y, min_x:max_x]
-    masked_img = image.copy()
-    masked_img[~mask] = 0
-    extracted = masked_img[min_y:max_y, min_x:max_x]
-
-    return extracted, (min_x, min_y, max_x, max_y), clipped_mask
-
-
-def adapt_homography_for_cropped_regions(
-    H: Array,
-    ref_bbox: Tuple[int, int, int, int],
-    test_bbox: Tuple[int, int, int, int],
-) -> Array:
-    """
-    Смещает гомографию к локальным координатам вырезанных областей.
-    """
-    ref_min_x, ref_min_y, _, _ = ref_bbox
-    test_min_x, test_min_y, _, _ = test_bbox
-
-    T_ref = np.array([[1, 0, -ref_min_x],
-                      [0, 1, -ref_min_y],
-                      [0, 0, 1]])
-    T_test_inv = np.array([[1, 0, test_min_x],
-                           [0, 1, test_min_y],
-                           [0, 0, 1]])
-
-    return T_ref @ H @ T_test_inv
-
-
-def shift_corners_to_origin(corners: List[Tuple[float, float]], bbox: Tuple[int, int, int, int]
-                            ) -> List[Tuple[float, float]]:
-    """
-    Переводит координаты углов в локальную систему (0,0) относительно bounding-box.
-    """
-    if not corners or len(corners) < 4:
-        return corners
-    min_x, min_y = bbox[0], bbox[1]
-    return [(x - min_x, y - min_y) for (x, y) in corners]
-
-
-def transform_pcb_to_reference(
-    test_pcb_region: Array,
-    H_adapted: Array,
-    reference_pcb_region_shape: Tuple[int, ...],
-) -> Array:
-    """
-    Преобразует вырезанную область тестовой платы в координаты вырезанной области эталонной платы.
-    """
-    ref_height, ref_width = reference_pcb_region_shape[:2]
-    if len(reference_pcb_region_shape) == 3:
-        transformed = np.zeros((ref_height, ref_width, reference_pcb_region_shape[2]),
-                               dtype=test_pcb_region.dtype)
+    height, width = output_shape
+    is_grayscale = image.ndim == 2
+    channels = image.shape[2] if image.ndim == 3 else 1
+    
+    inv_h = np.linalg.inv(H)
+    yy, xx = np.indices((height, width))
+    homog = np.stack([xx.ravel(), yy.ravel(), np.ones_like(xx).ravel()], axis=0)
+    mapped = inv_h @ homog
+    mapped /= mapped[2:3]
+    src_x = mapped[0].reshape(height, width)
+    src_y = mapped[1].reshape(height, width)
+    
+    valid = (
+        (src_x >= 0) & (src_x < image.shape[1] - 1) &
+        (src_y >= 0) & (src_y < image.shape[0] - 1)
+    )
+    
+    if is_grayscale:
+        result = ndi.map_coordinates(image, [src_y, src_x], order=1, mode="nearest", cval=0.0)
+        result[~valid] = 0.0
+        return result
     else:
-        transformed = np.zeros((ref_height, ref_width), dtype=test_pcb_region.dtype)
-
-    y_ref, x_ref = np.indices((ref_height, ref_width))
-    ones = np.ones_like(x_ref)
-    ref_coords_homogeneous = np.stack([x_ref.ravel(), y_ref.ravel(), ones.ravel()])
-
-    H_adapted_inv = np.linalg.inv(H_adapted)
-    test_coords_homogeneous = H_adapted_inv @ ref_coords_homogeneous
-    test_x = test_coords_homogeneous[0] / test_coords_homogeneous[2]
-    test_y = test_coords_homogeneous[1] / test_coords_homogeneous[2]
-
-    test_x_int = np.round(test_x).astype(int)
-    test_y_int = np.round(test_y).astype(int)
-    valid_mask = (
-        (test_x_int >= 0)
-        & (test_x_int < test_pcb_region.shape[1])
-        & (test_y_int >= 0)
-        & (test_y_int < test_pcb_region.shape[0])
-    )
-
-    valid_indices_ref = np.where(valid_mask.reshape(ref_height, ref_width))
-    valid_indices_test_y = test_y_int[valid_mask]
-    valid_indices_test_x = test_x_int[valid_mask]
-
-    transformed[valid_indices_ref[0], valid_indices_ref[1]] = test_pcb_region[
-        valid_indices_test_y, valid_indices_test_x
-    ]
-    return transformed
+        result = np.zeros((height, width, channels), dtype=np.float32)
+        for c in range(channels):
+            result[..., c] = ndi.map_coordinates(
+                image[..., c], [src_y, src_x], order=1, mode="nearest", cval=0.0
+            )
+        result[~valid] = 0.0
+        return result
 
 
-@dataclasses.dataclass
-class AlignmentResult:
-    success: bool
-    warped: Array
-    valid_mask: Array
-    inliers: int
-    total_matches: int
-    message: str = ""
-
-
-def _prepare_for_alignment(image: Array) -> Array:
-    gray = color.rgb2gray(image)
-    enhanced = exposure.equalize_adapthist(gray, clip_limit=0.03)
-    return enhanced.astype(np.float32)
-
-
-def align_images(reference: Array, test: Array, max_keypoints: int = 2000) -> AlignmentResult:
-    ref_gray = _prepare_for_alignment(reference)
-    test_gray = _prepare_for_alignment(test)
-
-    orb_ref = feature.ORB(n_keypoints=max_keypoints, fast_threshold=0.08)
-    orb_ref.detect_and_extract(ref_gray)
-    orb_test = feature.ORB(n_keypoints=max_keypoints, fast_threshold=0.08)
-    orb_test.detect_and_extract(test_gray)
-
-    if len(orb_ref.keypoints) < 10 or len(orb_test.keypoints) < 10:
-        msg = "Недостаточно ключевых точек для гомографии."
-        return AlignmentResult(False, test, np.ones(ref_gray.shape, dtype=bool), 0, 0, msg)
-
-    matches = feature.match_descriptors(
-        orb_ref.descriptors,
-        orb_test.descriptors,
-        cross_check=True,
-        metric="hamming",
-    )
-
-    if len(matches) < 8:
-        msg = "Недостаточно совпадений дескрипторов."
-        return AlignmentResult(False, test, np.ones(ref_gray.shape, dtype=bool), 0, len(matches), msg)
-
-    src = orb_test.keypoints[matches[:, 1]]
-    dst = orb_ref.keypoints[matches[:, 0]]
-
-    model, inliers = ransac(
-        (src, dst),
-        transform.ProjectiveTransform,
-        min_samples=4,
-        residual_threshold=2.0,
-        max_trials=5000,
-    )
-
-    if model is None or inliers is None or inliers.sum() < 6:
-        msg = "RANSAC не смог найти устойчивую гомографию."
-        return AlignmentResult(False, test, np.ones(ref_gray.shape, dtype=bool), 0, len(matches), msg)
-
-    warped = transform.warp(
-        test,
-        model.inverse,
-        output_shape=reference.shape,
-        order=1,
-        mode="edge",
-        cval=0.0,
-        preserve_range=True,
-    ).astype(np.float32)
-
-    coverage = transform.warp(
-        np.ones(test_gray.shape, dtype=np.float32),
-        model.inverse,
-        output_shape=ref_gray.shape,
-        order=0,
-        mode="constant",
-        cval=0.0,
-        preserve_range=True,
-    )
-    valid_mask = coverage > 0.5
-
-    return AlignmentResult(True, warped, valid_mask, int(inliers.sum()), int(len(matches)))
+def order_corners_clockwise(corners: np.ndarray) -> np.ndarray:
+    """
+    Упорядочивает углы по часовой стрелке: верх-левый, верх-правый, низ-правый, низ-левый.
+    
+    Parameters:
+    -----------
+    corners : np.ndarray
+        Массив углов формы (N, 2) с координатами (y, x)
+    
+    Returns:
+    --------
+    np.ndarray
+        Упорядоченные углы (4, 2)
+    """
+    if len(corners) != 4:
+        return corners
+    
+    # Находим центр
+    center = corners.mean(axis=0)
+    
+    # Вычисляем углы относительно центра
+    angles = np.arctan2(corners[:, 0] - center[0], corners[:, 1] - center[1])
+    
+    # Сортируем по углу
+    sorted_indices = np.argsort(angles)
+    sorted_corners = corners[sorted_indices]
+    
+    # Определяем верхние и нижние углы
+    top = sorted_corners[sorted_corners[:, 0] < center[0]]
+    bottom = sorted_corners[sorted_corners[:, 0] >= center[0]]
+    
+    if len(top) == 2 and len(bottom) == 2:
+        # Сортируем верхние по x
+        top = top[top[:, 1].argsort()]
+        # Сортируем нижние по x
+        bottom = bottom[bottom[:, 1].argsort()]
+        # Порядок: верх-левый, верх-правый, низ-правый, низ-левый
+        return np.array([top[0], top[1], bottom[1], bottom[0]])
+    
+    return sorted_corners
 
 
 @dataclasses.dataclass
@@ -286,9 +352,11 @@ class DetectionConfig:
     min_component_area: int = 120
     closing_size: int = 5
     max_keypoints: int = 2000
-    pcb_padding: int = 5
-    reference_corners: List[Tuple[float, float]] | None = None
-    test_corners: List[Tuple[float, float]] | None = None
+    # Параметры для нахождения границ платы
+    corner_tolerance: float = 2.5
+    corner_gaussian_sigma: float = 1.0
+    corner_closing_radius: int = 3
+    corner_hole_threshold: int = 5000
 
 
 def compute_difference_maps(
@@ -376,83 +444,122 @@ def visualize(reference: Array, test: Array, diff: Array, extra: List[dict], mis
     plt.show()
 
 
-def align_using_corner_annotations(
-    reference: Array,
-    test: Array,
-    reference_corners: List[Tuple[float, float]],
-    test_corners: List[Tuple[float, float]],
-    padding: int,
-) -> Tuple[Array, Array, Array]:
-    """
-    Выравнивает плату теста относительно эталона по заранее известным углам.
-    Возвращает: (вырезанная эталонная область, трансформированный тест, валидная маска).
-    """
-    reference_region, ref_bbox, ref_mask = extract_pcb_region(reference, reference_corners, padding=padding)
-    test_region, test_bbox, test_mask = extract_pcb_region(test, test_corners, padding=padding)
-
-    H = find_equals(np.asarray(test_corners, dtype=np.float32), np.asarray(reference_corners, dtype=np.float32))
-    H_adapted = adapt_homography_for_cropped_regions(H, ref_bbox, test_bbox)
-
-    transformed_test = transform_pcb_to_reference(test_region, H_adapted, reference_region.shape)
-    transformed_test_mask = transform_pcb_to_reference(
-        (test_mask.astype(np.uint8) * 255),
-        H_adapted,
-        reference_region.shape[:2],
-    ) > 0
-
-    valid_mask = ref_mask & transformed_test_mask
-
-    return reference_region.astype(np.float32), transformed_test.astype(np.float32), valid_mask
-
-
-def detect_components(reference_path: str, test_path: str, config: DetectionConfig) -> None:
-    reference_full = load_image(reference_path)
-    test_full = load_image(test_path)
-
-    use_corners = bool(config.reference_corners and config.test_corners)
-    reference_for_diff: Array = reference_full
-    aligned_test: Array | None = None
-    valid_mask: Array | None = None
-
-    if use_corners:
-        try:
-            print("[i] Используем заданные углы платы для вычисления гомографии.")
-            reference_for_diff, aligned_test, valid_mask = align_using_corner_annotations(
-                reference_full,
-                test_full,
-                config.reference_corners or [],
-                config.test_corners or [],
-                padding=config.pcb_padding,
-            )
-            print("[i] Гомография по углам успешно применена.")
-        except ValueError as err:
-            print(f"[!] Не удалось применить гомографию по углам: {err}")
-            aligned_test = None
-
-    if aligned_test is None:
-        alignment = align_images(reference_full, test_full, max_keypoints=config.max_keypoints)
-        if not alignment.success:
-            print(f"[!] Автовыравнивание не удалось: {alignment.message}")
-            aligned_test = test_full
-            valid_mask = np.ones(reference_full.shape[:2], dtype=bool)
+def detect_components(
+    reference_path: str,
+    test_path: str,
+    config: DetectionConfig,
+    show_corners: bool = True,
+) -> None:
+    reference = load_image(reference_path)
+    test = load_image(test_path)
+    
+    print("\n=== Поиск границ плат ===")
+    
+    # Находим углы эталонной платы
+    print("Поиск углов эталонной платы...")
+    ref_corners = find_board_corners(
+        reference,
+        tolerance=config.corner_tolerance,
+        gaussian_sigma=config.corner_gaussian_sigma,
+        closing_radius=config.corner_closing_radius,
+        hole_area_threshold=config.corner_hole_threshold,
+        debug=show_corners,
+    )
+    
+    # Находим углы тестовой платы
+    print("Поиск углов тестовой платы...")
+    test_corners = find_board_corners(
+        test,
+        tolerance=config.corner_tolerance,
+        gaussian_sigma=config.corner_gaussian_sigma,
+        closing_radius=config.corner_closing_radius,
+        hole_area_threshold=config.corner_hole_threshold,
+        debug=show_corners,
+    )
+    
+    aligned_test = test.copy()
+    valid_mask = np.ones(reference.shape[:2], dtype=bool)
+    alignment_applied = False
+    
+    # Выравниваем изображения, если найдено по 4 угла
+    if ref_corners is not None and test_corners is not None:
+        if len(ref_corners) == 4 and len(test_corners) == 4:
+            try:
+                print("\n=== Выравнивание изображений ===")
+                
+                # Упорядочиваем углы по часовой стрелке
+                ref_ordered = order_corners_clockwise(ref_corners)
+                test_ordered = order_corners_clockwise(test_corners)
+                
+                print(f"Эталонные углы (y, x):")
+                for i, (y, x) in enumerate(ref_ordered):
+                    print(f"  {i}: ({y:.1f}, {x:.1f})")
+                
+                print(f"Тестовые углы (y, x):")
+                for i, (y, x) in enumerate(test_ordered):
+                    print(f"  {i}: ({y:.1f}, {x:.1f})")
+                
+                # Вычисляем гомографию
+                H = compute_homography(test_ordered, ref_ordered)
+                print(f"Матрица гомографии вычислена")
+                
+                # Применяем гомографию
+                aligned_test = warp_with_homography(test, H, reference.shape[:2])
+                
+                # Создаём маску валидных пикселей
+                mask_ones = np.ones(test.shape[:2], dtype=np.float32)
+                mask_warp = warp_with_homography(mask_ones, H, reference.shape[:2])
+                valid_mask = mask_warp > 0.5
+                
+                alignment_applied = True
+                print(f"Выравнивание применено. Покрытие: {valid_mask.mean()*100:.1f}%")
+                
+                # Показываем результат выравнивания
+                if show_corners:
+                    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+                    axes[0].imshow(reference)
+                    axes[0].set_title("Эталон")
+                    axes[0].axis("off")
+                    
+                    axes[1].imshow(test)
+                    axes[1].set_title("Тест (оригинал)")
+                    axes[1].axis("off")
+                    
+                    axes[2].imshow(aligned_test)
+                    axes[2].set_title("Тест (после выравнивания)")
+                    axes[2].axis("off")
+                    plt.suptitle("Результат выравнивания", fontsize=14)
+                    plt.tight_layout()
+                    plt.show()
+                    
+            except Exception as exc:
+                print(f"[!] Ошибка при выравнивании: {exc}")
+                import traceback
+                traceback.print_exc()
+                aligned_test = test
+                valid_mask = np.ones(reference.shape[:2], dtype=bool)
         else:
-            print(
-                f"[i] Выравнивание успешно: inliers {alignment.inliers}/{alignment.total_matches}"
-            )
-            aligned_test = alignment.warped
-            valid_mask = alignment.valid_mask
-        reference_for_diff = reference_full
-
+            print(f"[!] Найдено не по 4 угла: эталон={len(ref_corners) if ref_corners is not None else 0}, тест={len(test_corners) if test_corners is not None else 0}")
+            print("[!] Выравнивание пропущено, работаю с исходными изображениями")
+    else:
+        print("[!] Не удалось найти углы на одной из плат, работаю с исходными изображениями")
+    
+    print("\n=== Поиск отличий ===")
+    if alignment_applied:
+        print("[i] Сравнение выполняется между ВЫРОВНЕННЫМИ изображениями")
+    else:
+        print("[!] ВНИМАНИЕ: Сравнение выполняется между НЕВЫРОВНЕННЫМИ изображениями!")
+    
     diff, extra_mask, missing_mask = compute_difference_maps(
-        reference_for_diff,
-        aligned_test,
+        reference,
+        aligned_test,  # Используем выровненное изображение
         config,
         valid_mask=valid_mask,
     )
     extra_regions = extract_regions(extra_mask, diff, config.min_component_area)
     missing_regions = extract_regions(missing_mask, diff, config.min_component_area)
 
-    print("=== Детектор компонентов ===")
+    print("\n=== Детектор компонентов ===")
     print(f"Лишние компоненты: {len(extra_regions)}")
     for idx, region in enumerate(extra_regions, 1):
         print(f"  #{idx}: центр={region['center']}, площадь={region['area']}, score={region['score']:.4f}")
@@ -461,17 +568,22 @@ def detect_components(reference_path: str, test_path: str, config: DetectionConf
     for idx, region in enumerate(missing_regions, 1):
         print(f"  #{idx}: центр={region['center']}, площадь={region['area']}, score={region['score']:.4f}")
 
-    visualize(reference_for_diff, aligned_test, diff, extra_regions, missing_regions)
-
-
+    visualize(reference, aligned_test, diff, extra_regions, missing_regions)
+    
 def main() -> None:
     config = DetectionConfig(
         blur_sigma=2.0,
         diff_threshold=3.0,
         min_component_area=150,
         closing_size=5,
+        corner_tolerance=2.5,
+        corner_gaussian_sigma=1.0,
+        corner_closing_radius=3,
+        corner_hole_threshold=5000,
     )
-    detect_components("chess.jpg", "chessboard_3_3.jpg", config)
+    
+    # Детекция компонентов с автоматическим поиском границ и выравниванием
+    detect_components("chess.jpg", "chessboard_3_3.jpg", config, show_corners=True)
 
 
 if __name__ == "__main__":
