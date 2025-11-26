@@ -1,43 +1,156 @@
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+from pathlib import Path as FilePath
+import struct
+import sys
+import pickle
+
+import math
 import numpy as np
+import serial
 from PIL import Image
 import matplotlib.pyplot as plt
 from scipy import ndimage
-import math
-from matplotlib.path import Path
+from matplotlib.path import Path as MplPath
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("[Предупреждение] Модуль cv2 (OpenCV) не установлен. Устранение дисторсии недоступно.")
 
 
-def find_equals(src_points, dst_points):
+# ========== Функции для устранения дисторсии ==========
+
+def undistort_image(image: np.ndarray, calibration_file: str = 'camera_calibration.pkl') -> np.ndarray:
     """
-    Вычисляет матрицу гомографии H (3x3) из соответствий точек
+    Устраняет дисторсию изображения с использованием калибровочных данных камеры.
+    
+    Parameters:
+    image: numpy array - исходное изображение (BGR или RGB)
+    calibration_file: str - путь к файлу калибровки
+    
+    Returns:
+    numpy array - изображение без дисторсии
     """
-    if len(src_points) < 4 or len(dst_points) < 4:
-        raise ValueError("Нужно минимум 4 точки для вычисления гомографии")
+    if not CV2_AVAILABLE:
+        print("[Предупреждение] OpenCV недоступен, устранение дисторсии пропущено.")
+        return image
+    
+    calib_path = FilePath(calibration_file)
+    if not calib_path.exists():
+        print(f"[Предупреждение] Файл калибровки {calibration_file} не найден, устранение дисторсии пропущено.")
+        return image
+    
+    try:
+        # Загрузка калибровочных данных
+        with open(calibration_file, 'rb') as f:
+            mtx, dist = pickle.load(f)
+        
+        h, w = image.shape[:2]
+        
+        # Получаем оптимальную матрицу камеры
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 1, (w, h))
+        
+        # Устранение дисторсии
+        dst = cv2.undistort(image, mtx, dist, None, newcameramtx)
+        
+        # Обрезаем изображение по ROI
+        x, y, w_roi, h_roi = roi
+        dst = dst[y:y+h_roi, x:x+w_roi]
+        
+        print(f"✓ Дисторсия устранена. Исходный размер: {image.shape}, новый размер: {dst.shape}")
+        return dst
+    
+    except Exception as e:
+        print(f"[Ошибка] Не удалось устранить дисторсию: {e}")
+        return image
 
-    if len(src_points) != len(dst_points):
-        raise ValueError("Количество исходных и целевых точек должно совпадать")
 
-    # Строим матрицу A для системы уравнений A * h = 0
+CMD_PING = b"\x70"
+CMD_CAPTURE = b"\x71"
+PING_REPLY = b"OK"
+
+
+def read_exact(port: serial.Serial, size: int, timeout_message: str) -> bytes:
+    """Читает ровно size байт или выбрасывает TimeoutError."""
+    buffer = bytearray()
+    while len(buffer) < size:
+        chunk = port.read(size - len(buffer))
+        if not chunk:
+            raise TimeoutError(timeout_message)
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
+def capture_once(port_name: str, output_path: FilePath, baudrate: int, timeout: float) -> FilePath:
+    """Делает снимок с OpenMV и сохраняет его в output_path."""
+    with serial.Serial(port=port_name, baudrate=baudrate, timeout=timeout) as ser:
+        ser.reset_input_buffer()
+        ser.write(CMD_PING)
+        reply = read_exact(ser, len(PING_REPLY), "Не получил ping-ответ от камеры.")
+        if reply != PING_REPLY:
+            raise RuntimeError(
+                f"Камера не отвечает на ping (ожидалось {PING_REPLY!r}, получено {reply!r}). "
+                "Проверьте, что на OpenMV запущен скрипт openmv_capture_slave.py."
+            )
+
+        ser.write(CMD_CAPTURE)
+        raw_len = read_exact(ser, 4, "Не дождался длины JPEG от камеры.")
+        (jpeg_len,) = struct.unpack("<I", raw_len)
+        data = read_exact(ser, jpeg_len, "Не удалось дочитать JPEG полностью.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(data)
+    return output_path
+
+
+def default_filename(folder: FilePath, prefix: str) -> FilePath:
+    """Формирует имя файла по текущей дате."""
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{prefix}_{timestamp}.jpg"
+
+
+def get_homography(src_points, dst_points):
+    """
+    Вычисляет матрицу гомографии на основе четырех соответствующих точек.
+    Из gomography.py - использует правильную формулу для растяжения изображений.
+
+    :param src_points: Список исходных точек (x, y)
+    :param dst_points: Список целевых точек (x, y)
+    :return: Матрица гомографии 3x3
+    """
+    assert len(src_points) == 4 and len(dst_points) == 4, "Должно быть ровно 4 точки."
+
+    # Создание матрицы A
     A = []
-    for i in range(len(src_points)):
+    for i in range(4):
         x, y = src_points[i]
         x_prime, y_prime = dst_points[i]
-
-        A.append([x, y, 1, 0, 0, 0, -x_prime * x, -x_prime * y, -x_prime])
-        A.append([0, 0, 0, x, y, 1, -y_prime * x, -y_prime * y, -y_prime])
+        A.append([-x, -y, -1, 0, 0, 0, x * x_prime, y * x_prime, x_prime])
+        A.append([0, 0, 0, -x, -y, -1, x * y_prime, y * y_prime, y_prime])
 
     A = np.array(A)
 
-    # Решаем систему A * h = 0 методом SVD
+    # Решение для матрицы H с использованием SVD
     U, S, Vt = np.linalg.svd(A)
-
-    # Последняя строка Vt соответствует наименьшему собственному значению
     H = Vt[-1].reshape(3, 3)
 
-    # Нормализуем матрицу (делаем H[2,2] = 1)
-    H = H / H[2, 2]
+    # Нормализация матрицы H
+    H /= H[2, 2]
     print(f"H: {H}")
 
     return H
+
+
+# Сохраняем старую функцию для обратной совместимости
+def find_equals(src_points, dst_points):
+    """Алиас для get_homography для обратной совместимости"""
+    return get_homography(src_points, dst_points)
 
 
 def extract_pcb_region(image, corners, padding=5):
@@ -57,7 +170,7 @@ def extract_pcb_region(image, corners, padding=5):
         return image.copy(), (0, 0, w, h), np.ones((h, w), dtype=bool)
 
     h, w = image.shape[:2]
-    poly_path = Path(corners)
+    poly_path = MplPath(corners)
     y_grid, x_grid = np.mgrid[0:h, 0:w]
     coords = np.vstack((x_grid.ravel(), y_grid.ravel())).T
     mask = poly_path.contains_points(coords).reshape(h, w)
@@ -133,63 +246,333 @@ def shift_corners_to_origin(corners, bbox):
     return [(x - min_x, y - min_y) for (x, y) in corners]
 
 
-def transform_pcb_to_reference(test_pcb_region, H_adapted, reference_pcb_region_shape):
+def subpixel(image, x, y):
     """
-    Преобразует вырезанную область тестовой платы в координаты вырезанной области эталонной платы
+    Билинейная интерполяция для получения цвета пикселя в субпиксельных координатах.
+    Из gomography.py - обеспечивает качественное растяжение изображений.
+    """
+    width_img, height_img = image.size
+    x_A, y_A = int(round(x)), int(round(y))
+    x_B, y_B = (x_A + 1), y_A
+    x_C, y_C = x_A, (y_A + 1)
+    x_D, y_D = (x_A + 1), (y_A + 1)
+
+    if 0 <= x_A < width_img and 0 <= y_A < height_img and \
+       0 <= x_B < width_img and 0 <= y_B < height_img and \
+       0 <= x_C < width_img and 0 <= y_C < height_img and \
+       0 <= x_D < width_img and 0 <= y_D < height_img:
+
+        P_A = image.getpixel((x_A, y_A))
+        P_B = image.getpixel((x_B, y_B))
+        P_C = image.getpixel((x_C, y_C))
+        P_D = image.getpixel((x_D, y_D))
+
+        # Билинейная интерполяция по Y
+        P_E = tuple(a * (1 - (y - y_A)) + b * (1 - (y_C - y)) for a, b in zip(P_A, P_C))
+        P_F = tuple(a * (1 - (y - y_B)) + b * (1 - (y_D - y)) for a, b in zip(P_B, P_D))
+
+        # Билинейная интерполяция по X
+        P = tuple(int(a * (1 - (x - x_A)) + b * (1 - (x_B - x))) for a, b in zip(P_E, P_F))
+    else:
+        # Если координаты вне границ, возвращаем ближайший пиксель
+        x_safe = max(0, min(width_img - 1, int(round(x))))
+        y_safe = max(0, min(height_img - 1, int(round(y))))
+        P = image.getpixel((x_safe, y_safe))
+
+    return P
+
+
+def apply_homography_img(image, H, width, height):
+    """
+    Применяет матрицу гомографии к изображению с билинейной интерполяцией.
+    Из gomography.py - обеспечивает качественное растяжение изображений.
+
+    :param image: Исходное изображение (PIL Image)
+    :param H: Матрица гомографии 3x3
+    :param width: Ширина выходного изображения
+    :param height: Высота выходного изображения
+    :return: Преобразованное изображение (PIL Image)
+    """
+    # Получение размеров изображения
+    width_img, height_img = image.size
+
+    # Создание нового изображения для хранения результата
+    transformed_image = Image.new("RGB", (width, height))
+
+    # Преобразование матрицы гомографии в обратную
+    H_inv = np.linalg.inv(H)
+
+    for y in range(height):
+        for x in range(width):
+            # Преобразование координат пикселя в однородные координаты
+            original_point = np.array([x, y, 1])
+            transformed_point = H_inv @ original_point
+
+            # Нормализация
+            transformed_point /= transformed_point[2]
+
+            # Получение новых координат
+            src_x, src_y = transformed_point[0], transformed_point[1]
+
+            # Проверка, находятся ли новые координаты в пределах изображения
+            if 0 <= src_x < width_img and 0 <= src_y < height_img:
+                # Используем билинейную интерполяцию для качественного растяжения
+                transformed_image.putpixel((x, y), subpixel(image, src_x, src_y))
+
+    return transformed_image
+
+
+def transform_pcb_to_reference(test_pcb_region, H_adapted, reference_pcb_region_shape, test_mask=None):
+    """
+    Преобразует вырезанную область тестовой платы в координаты вырезанной области эталонной платы.
+    Теперь использует PIL с билинейной интерполяцией для качественного растяжения.
+    Удаляет черный фон, оставляя только область платы.
 
     Parameters:
     test_pcb_region: numpy array - вырезанная область тестовой платы
     H_adapted: numpy array (3x3) - адаптированная матрица гомографии
     reference_pcb_region_shape: tuple - размер вырезанной области эталонной платы
+    test_mask: numpy array (optional) - маска платы для удаления фона
 
     Returns:
-    numpy array - преобразованная область тестовой платы
+    numpy array - преобразованная область тестовой платы без черного фона
     """
     ref_height, ref_width = reference_pcb_region_shape[:2]
 
-    # Создаем пустой массив того же размера, что и вырезанная эталонная область
-    if len(reference_pcb_region_shape) == 3:
-        transformed = np.zeros((ref_height, ref_width, reference_pcb_region_shape[2]), dtype=test_pcb_region.dtype)
+    # Конвертируем numpy array в PIL Image для качественного преобразования
+    if test_pcb_region.dtype != np.uint8:
+        if test_pcb_region.max() <= 1.0:
+            test_pcb_uint8 = (np.clip(test_pcb_region, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            test_pcb_uint8 = np.clip(test_pcb_region, 0, 255).astype(np.uint8)
     else:
-        transformed = np.zeros((ref_height, ref_width), dtype=test_pcb_region.dtype)
-
-    # Создаем координатную сетку для эталонной области
-    y_ref, x_ref = np.indices((ref_height, ref_width))
-    ones = np.ones_like(x_ref)
-
-    # Преобразуем координаты в однородные
-    ref_coords_homogeneous = np.stack([x_ref.ravel(), y_ref.ravel(), ones.ravel()])
-
-    # Применяем обратную адаптированную гомографию
-    H_adapted_inv = np.linalg.inv(H_adapted)
-    test_coords_homogeneous = H_adapted_inv @ ref_coords_homogeneous
-
-    # Нормализуем координаты
-    test_x = test_coords_homogeneous[0] / test_coords_homogeneous[2]
-    test_y = test_coords_homogeneous[1] / test_coords_homogeneous[2]
-
-    # Округляем до целых пикселей (ближайший сосед)
-    test_x_int = np.round(test_x).astype(int)
-    test_y_int = np.round(test_y).astype(int)
-
-    # Создаем маску для валидных координат
-    valid_mask = ((test_x_int >= 0) & (test_x_int < test_pcb_region.shape[1]) &
-                  (test_y_int >= 0) & (test_y_int < test_pcb_region.shape[0]))
-
-    # Преобразуем индексы обратно в 2D
-    valid_indices_ref = np.where(valid_mask.reshape(ref_height, ref_width))
-    valid_indices_test_y = test_y_int[valid_mask]
-    valid_indices_test_x = test_x_int[valid_mask]
-
-    # Копируем пиксели из тестовой области в эталонные координаты
+        test_pcb_uint8 = test_pcb_region
+    # Создаем PIL Image из numpy array
     if len(test_pcb_region.shape) == 3:
-        transformed[valid_indices_ref[0], valid_indices_ref[1]] = \
-            test_pcb_region[valid_indices_test_y, valid_indices_test_x]
+        test_pil = Image.fromarray(test_pcb_uint8, mode='RGB')
     else:
-        transformed[valid_indices_ref[0], valid_indices_ref[1]] = \
-            test_pcb_region[valid_indices_test_y, valid_indices_test_x]
+        # Grayscale -> RGB
+        test_pil = Image.fromarray(test_pcb_uint8, mode='L').convert('RGB')
 
-    return transformed
+    # Применяем гомографию с билинейной интерполяцией
+    transformed_pil = apply_homography_img(test_pil, H_adapted, ref_width, ref_height)
+
+    # Конвертируем обратно в numpy array
+    transformed_array = np.asarray(transformed_pil).astype(np.float32) / 255.0
+
+    # Если исходное было grayscale, конвертируем обратно
+    if len(test_pcb_region.shape) == 2:
+        transformed_array = np.dot(transformed_array[..., :3], [0.2989, 0.5870, 0.1140])
+
+    # Удаляем черный фон, используя маску или автоматическое определение
+    if test_mask is not None:
+        # Преобразуем маску так же, как изображение
+        mask_uint8 = (test_mask.astype(np.uint8) * 255)
+        if len(mask_uint8.shape) == 2:
+            mask_pil = Image.fromarray(mask_uint8, mode='L').convert('RGB')
+        else:
+            mask_pil = Image.fromarray(mask_uint8, mode='RGB')
+        
+        transformed_mask_pil = apply_homography_img(mask_pil, H_adapted, ref_width, ref_height)
+        transformed_mask = np.asarray(transformed_mask_pil).astype(np.float32) / 255.0
+        
+        # Берем только один канал маски
+        if len(transformed_mask.shape) == 3:
+            mask_gray = np.dot(transformed_mask[..., :3], [0.2989, 0.5870, 0.1140])
+        else:
+            mask_gray = transformed_mask
+        
+        # Применяем маску: обнуляем пиксели вне платы (более строгий порог)
+        mask_bool = mask_gray > 0.3  # Снижен порог для лучшего удаления фона
+        
+        # Обнуляем пиксели вне платы
+        if len(transformed_array.shape) == 3:
+            transformed_array[~mask_bool] = 0.0
+    else:
+        transformed_array[~mask_bool] = 0.0
+        # Автоматическое определение черного фона
+        # Черный фон - это пиксели с очень низкой яркостью
+        if len(transformed_array.shape) == 3:
+            brightness = np.mean(transformed_array, axis=2)
+        else:
+            brightness = transformed_array
+        
+        # Более умное определение фона: используем адаптивный порог
+        # Фон - это пиксели, которые значительно темнее среднего значения
+        mean_brightness = np.mean(brightness[brightness > 0.1])  # Среднее по не-черным пикселям
+        if mean_brightness > 0:
+            background_threshold = min(0.1, mean_brightness * 0.3)  # 30% от среднего или 0.1
+        else:
+            background_threshold = 0.05
+        
+        mask_bool = brightness > background_threshold
+        
+        # Обнуляем пиксели фона
+        if len(transformed_array.shape) == 3:
+            transformed_array[~mask_bool] = 0.0
+        else:
+            transformed_array[~mask_bool] = 0.0
+
+    # Приводим к исходному типу данных
+    if test_pcb_region.dtype == np.uint8:
+        transformed_array = (transformed_array * 255.0).astype(np.uint8)
+    else:
+        transformed_array = transformed_array.astype(test_pcb_region.dtype)
+
+    return transformed_array
+
+
+def rectify_pcb_to_corners(image, corners, output_size=None):
+    """
+    Растягивает плату так, чтобы её углы совпадали с углами изображения.
+    
+    Parameters:
+    image: numpy array - исходное изображение с платой
+    corners: list - список углов платы [(x1,y1), (x2,y2), (x3,y3), (x4,y4)]
+    output_size: tuple (width, height) - размер выходного изображения. 
+                 Если None, вычисляется автоматически на основе bounding box углов.
+    
+    Returns:
+    numpy array - выпрямленное изображение платы
+    numpy array - маска платы
+    """
+    if not corners or len(corners) < 4:
+        return image, np.ones(image.shape[:2], dtype=bool)
+    
+    # Упорядочиваем углы: верх-левый, верх-правый, низ-правый, низ-левый
+    corners_array = np.array(corners, dtype=np.float32)
+    
+    # Находим центр масс
+    center = corners_array.mean(axis=0)
+    
+    # Сортируем углы по углу относительно центра
+    angles = np.arctan2(corners_array[:, 1] - center[1], corners_array[:, 0] - center[0])
+    sorted_indices = np.argsort(angles)
+    sorted_corners = corners_array[sorted_indices]
+    
+    # Определяем верхние и нижние углы
+    top = sorted_corners[sorted_corners[:, 1] < center[1]]
+    bottom = sorted_corners[sorted_corners[:, 1] >= center[1]]
+    
+    if len(top) == 2 and len(bottom) == 2:
+        # Сортируем верхние по x
+        top = top[top[:, 0].argsort()]
+        # Сортируем нижние по x
+        bottom = bottom[bottom[:, 0].argsort()]
+        # Порядок: верх-левый, верх-правый, низ-правый, низ-левый
+        ordered_corners = np.array([top[0], top[1], bottom[1], bottom[0]], dtype=np.float32)
+    else:
+        ordered_corners = sorted_corners
+    
+    # Определяем размер выходного изображения
+    if output_size is None:
+        # Вычисляем размер на основе расстояний между углами
+        width = int(max(
+            np.linalg.norm(ordered_corners[1] - ordered_corners[0]),  # верхняя сторона
+            np.linalg.norm(ordered_corners[2] - ordered_corners[3])   # нижняя сторона
+        ))
+        height = int(max(
+            np.linalg.norm(ordered_corners[3] - ordered_corners[0]),  # левая сторона
+            np.linalg.norm(ordered_corners[2] - ordered_corners[1])  # правая сторона
+        ))
+    else:
+        width, height = output_size
+    
+    # Целевые углы - углы прямоугольного изображения
+    dst_corners = np.array([
+        [0, 0],           # верх-левый
+        [width - 1, 0],   # верх-правый
+        [width - 1, height - 1],  # низ-правый
+        [0, height - 1]   # низ-левый
+    ], dtype=np.float32)
+    
+    # Вычисляем гомографию для растяжения платы до углов изображения
+    H = get_homography(ordered_corners, dst_corners)
+    
+    # Конвертируем numpy array в PIL Image
+    if image.dtype != np.uint8:
+        if image.max() <= 1.0:
+            image_uint8 = (np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            image_uint8 = np.clip(image, 0, 255).astype(np.uint8)
+    else:
+        image_uint8 = image
+    
+    if len(image.shape) == 3:
+        image_pil = Image.fromarray(image_uint8, mode='RGB')
+    else:
+        image_pil = Image.fromarray(image_uint8, mode='L').convert('RGB')
+    
+    # Применяем гомографию для растяжения платы
+    rectified_pil = apply_homography_img(image_pil, H, width, height)
+    
+    # Конвертируем обратно в numpy array
+    rectified_array = np.asarray(rectified_pil).astype(np.float32) / 255.0
+    
+    # Если исходное было grayscale, конвертируем обратно
+    if len(image.shape) == 2:
+        rectified_array = np.dot(rectified_array[..., :3], [0.2989, 0.5870, 0.1140])
+    
+    # Создаем маску платы (вся область внутри прямоугольника)
+    mask = np.ones((height, width), dtype=bool)
+    
+    # Приводим к исходному типу данных
+    if image.dtype == np.uint8:
+        rectified_array = (rectified_array * 255.0).astype(np.uint8)
+    else:
+        rectified_array = rectified_array.astype(image.dtype)
+    
+    return rectified_array, mask
+
+
+def crop_to_pcb_region(image, threshold=0.05):
+    """
+    Обрезает изображение до минимального bounding box, содержащего плату (не черный фон).
+    
+    Parameters:
+    image: numpy array - изображение с платой
+    threshold: float - порог яркости для определения фона
+    
+    Returns:
+    numpy array - обрезанное изображение
+    tuple - (min_y, min_x, max_y, max_x) координаты обрезки
+    """
+    if len(image.shape) == 3:
+        brightness = np.mean(image, axis=2)
+    else:
+        brightness = image
+    
+    # Находим пиксели платы (не фон)
+    pcb_mask = brightness > threshold
+    
+    if not np.any(pcb_mask):
+        # Если плата не найдена, возвращаем исходное изображение
+        return image, (0, 0, image.shape[0], image.shape[1])
+    
+    # Находим bounding box
+    rows = np.any(pcb_mask, axis=1)
+    cols = np.any(pcb_mask, axis=0)
+    
+    if not np.any(rows) or not np.any(cols):
+        return image, (0, 0, image.shape[0], image.shape[1])
+    
+    min_y, max_y = np.where(rows)[0][[0, -1]]
+    min_x, max_x = np.where(cols)[0][[0, -1]]
+    
+    # Добавляем небольшой отступ
+    padding = 5
+    min_y = max(0, min_y - padding)
+    min_x = max(0, min_x - padding)
+    max_y = min(image.shape[0], max_y + padding + 1)
+    max_x = min(image.shape[1], max_x + padding + 1)
+    
+    # Обрезаем изображение
+    if len(image.shape) == 3:
+        cropped = image[min_y:max_y, min_x:max_x, :]
+    else:
+        cropped = image[min_y:max_y, min_x:max_x]
+
+    return cropped, (min_y, min_x, max_y, max_x)
 
 
 def to_grayscale_float(image):
@@ -548,57 +931,56 @@ class PCBCornerDetector:
             return None, test_corners, reference_corners, test_corners
 
 
-def main():
-    # Загрузка изображений
-    reference_img = Image.open('chess.jpg')
-    test_img = Image.open('chessboard_3_3.jpg')
-
-    reference_array = np.array(reference_img)
-    test_array = np.array(test_img)
-
-    print(f"Эталон: {reference_array.shape}, Тест: {test_array.shape}")
-
-    # Создаем детектор
+def run_comparison_pipeline(
+    reference_array: np.ndarray,
+    test_array: np.ndarray,
+    diff_threshold: float = 0.1,
+    grid_threshold: float = 0.13,
+    grid_size: int = 8,
+    show_plots: bool = True,
+):
+    """Полный конвейер выравнивания и сравнения плат."""
     detector = PCBCornerDetector()
-
-    # Выравниваем и сравниваем
     H, aligned_corners, ref_corners, test_corners = detector.align_and_compare(
         reference_array, test_array
     )
+    if H is None:
+        raise RuntimeError("Не удалось вычислить гомографию для сравнения.")
 
-    if H is not None:
-        # Вырезаем области плат из обоих изображений
-        reference_pcb_region, ref_bbox, ref_mask = extract_pcb_region(reference_array, ref_corners)
-        test_pcb_region, test_bbox, test_mask = extract_pcb_region(test_array, test_corners)
+    print("\n=== Растяжение плат до углов изображения ===")
+    ref_rectified, ref_mask_rectified = rectify_pcb_to_corners(reference_array, ref_corners)
+    test_rectified, test_mask_rectified = rectify_pcb_to_corners(test_array, test_corners)
 
-        # Нормализуем углы так, чтобы левый верхний угол стал (0,0)
-        ref_corners_local = shift_corners_to_origin(ref_corners, ref_bbox)
-        test_corners_local = shift_corners_to_origin(test_corners, test_bbox)
-        aligned_corners_local = shift_corners_to_origin(aligned_corners, ref_bbox)
+    ref_height, ref_width = ref_rectified.shape[:2]
+    test_height, test_width = test_rectified.shape[:2]
+    target_width = max(ref_width, test_width)
+    target_height = max(ref_height, test_height)
 
-        print(f"Вырезанная эталонная плата: {reference_pcb_region.shape}")
-        print(f"Вырезанная тестовая плата: {test_pcb_region.shape}")
-        print(f"BBox эталон: {ref_bbox}")
-        print(f"BBox тест: {test_bbox}")
-        print(f"Локальные углы эталона: {ref_corners_local}")
-        print(f"Локальные углы теста: {test_corners_local}")
-        print(f"Локальные выровненные углы: {aligned_corners_local}")
+    print(f"Размер эталонной платы после растяжения: {ref_rectified.shape}")
+    print(f"Размер тестовой платы после растяжения: {test_rectified.shape}")
+    print(f"Целевой размер для обеих плат: ({target_height}, {target_width})")
 
-        # Адаптируем матрицу гомографии для вырезанных областей
-        H_adapted = adapt_homography_for_cropped_regions(H, ref_bbox, test_bbox)
+    if ref_rectified.shape[:2] != (target_height, target_width):
+        ref_rectified, ref_mask_rectified = rectify_pcb_to_corners(
+            reference_array, ref_corners, output_size=(target_width, target_height)
+        )
 
-        # Преобразуем тестовую плату в координаты эталонной платы
-        transformed_test_pcb = transform_pcb_to_reference(test_pcb_region, H_adapted, reference_pcb_region.shape)
-        transformed_test_mask = transform_pcb_to_reference(
-            (test_mask.astype(np.uint8) * 255),
-            H_adapted,
-            reference_pcb_region.shape[:2]
-        ) > 0
+    if test_rectified.shape[:2] != (target_height, target_width):
+        test_rectified, test_mask_rectified = rectify_pcb_to_corners(
+            test_array, test_corners, output_size=(target_width, target_height)
+        )
 
-        # Визуализируем результаты
+    reference_pcb_region = ref_rectified
+    transformed_test_pcb = test_rectified
+    ref_mask = ref_mask_rectified
+    transformed_test_mask = test_mask_rectified
+
+    print(f"Финальный размер обеих плат: {reference_pcb_region.shape}")
+    print("[i] Платы растянуты до углов изображения и готовы к сравнению")
+
+    if show_plots:
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
-        # 1. Исходные изображения с углами
         axes[0, 0].imshow(reference_array)
         x_ref = [p[0] for p in ref_corners]
         y_ref = [p[1] for p in ref_corners]
@@ -613,29 +995,34 @@ def main():
         axes[0, 1].set_title('Тест с углами')
         axes[0, 1].axis('off')
 
-        # 2. Вырезанные области
         axes[1, 0].imshow(reference_pcb_region)
-        if ref_corners_local:
-            x_loc = [p[0] for p in ref_corners_local]
-            y_loc = [p[1] for p in ref_corners_local]
-            axes[1, 0].plot(x_loc, y_loc, 'go-', markersize=6)
-        axes[1, 0].set_title(f'Эталонная плата\n{reference_pcb_region.shape}')
+        h, w = reference_pcb_region.shape[:2]
+        corners_img = [(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)]
+        x_corners = [p[0] for p in corners_img]
+        y_corners = [p[1] for p in corners_img]
+        axes[1, 0].plot(
+            x_corners + [x_corners[0]], y_corners + [y_corners[0]],
+            'go-', markersize=6, linewidth=2
+        )
+        axes[1, 0].set_title(f'Эталонная плата (растянута)\n{reference_pcb_region.shape}')
         axes[1, 0].axis('off')
 
-        axes[1, 1].imshow(test_pcb_region)
-        if test_corners_local:
-            x_loc_t = [p[0] for p in test_corners_local]
-            y_loc_t = [p[1] for p in test_corners_local]
-            axes[1, 1].plot(x_loc_t, y_loc_t, 'bo-', markersize=6)
-        axes[1, 1].set_title(f'Тестовая плата\n{test_pcb_region.shape}')
+        axes[1, 1].imshow(transformed_test_pcb)
+        h_t, w_t = transformed_test_pcb.shape[:2]
+        corners_img_t = [(0, 0), (w_t - 1, 0), (w_t - 1, h_t - 1), (0, h_t - 1)]
+        x_corners_t = [p[0] for p in corners_img_t]
+        y_corners_t = [p[1] for p in corners_img_t]
+        axes[1, 1].plot(
+            x_corners_t + [x_corners_t[0]], y_corners_t + [y_corners_t[0]],
+            'bo-', markersize=6, linewidth=2
+        )
+        axes[1, 1].set_title(f'Тестовая плата (растянута)\n{transformed_test_pcb.shape}')
         axes[1, 1].axis('off')
 
-        # 3. Преобразованная плата
         axes[1, 2].imshow(transformed_test_pcb)
         axes[1, 2].set_title(f'Преобразованная\n{transformed_test_pcb.shape}')
         axes[1, 2].axis('off')
 
-        # 4. Сравнение эталонной и преобразованной
         axes[0, 2].imshow(reference_pcb_region)
         axes[0, 2].set_title('Эталонная для сравнения')
         axes[0, 2].axis('off')
@@ -651,7 +1038,7 @@ def main():
             transformed_test_pcb,
             ref_mask,
             transformed_test_mask,
-            diff_threshold=0.1
+        diff_threshold=diff_threshold
         )
 
         grid_info = compare_pcb_by_grid(
@@ -659,15 +1046,20 @@ def main():
             transformed_test_pcb,
             ref_mask,
             transformed_test_mask,
-            grid_size=8,
-            diff_threshold=0.13
+        grid_size=grid_size,
+        diff_threshold=grid_threshold
         )
+
+    if show_plots and (diff_visual is not None):
+        h, w = reference_pcb_region.shape[:2]
+        ref_corners_local = [(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)]
+        test_corners_local = [(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)]
 
         show_combined_visualization(
             reference_array,
             test_array,
             reference_pcb_region,
-            test_pcb_region,
+            transformed_test_pcb,
             transformed_test_pcb,
             diff_visual,
             ref_corners,
@@ -677,8 +1069,205 @@ def main():
             grid_info
         )
 
+    return {
+        "stats_pix": stats_pix,
+        "grid_info": grid_info,
+        "reference_size": reference_pcb_region.shape,
+        "test_size": transformed_test_pcb.shape,
+        "overlap_mask": overlap_mask,
+    }
+
+
+def run_comparison_from_paths(
+    reference_image_path: FilePath,
+    test_image_path: FilePath,
+    diff_threshold: float = 0.1,
+    grid_threshold: float = 0.13,
+    grid_size: int = 8,
+    show_plots: bool = True,
+):
+    """Загружает изображения с диска и запускает конвейер сравнения."""
+    reference_img = Image.open(reference_image_path)
+    test_img = Image.open(test_image_path)
+    reference_array = np.array(reference_img)
+    test_array = np.array(test_img)
+
+    print(f"Эталон (до устранения дисторсии): {reference_array.shape}")
+    print(f"Тест (до устранения дисторсии): {test_array.shape}")
+
+    # ========== ЭТАП 1: УСТРАНЕНИЕ ДИСТОРСИИ ==========
+    print("\n" + "="*60)
+    print("ЭТАП 1: УСТРАНЕНИЕ ДИСТОРСИИ")
+    print("="*60)
+    
+    reference_array = undistort_image(reference_array)
+    test_array = undistort_image(test_array)
+    
+    print(f"\nЭталон (после устранения дисторсии): {reference_array.shape}")
+    print(f"Тест (после устранения дисторсии): {test_array.shape}")
+
+    return run_comparison_pipeline(
+        reference_array,
+        test_array,
+        diff_threshold=diff_threshold,
+        grid_threshold=grid_threshold,
+        grid_size=grid_size,
+        show_plots=show_plots,
+    )
+
+
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Снятие эталонной платы и сравнение тестовой платы с помощью OpenMV."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_serial_common_args(target_parser: argparse.ArgumentParser) -> None:
+        target_parser.add_argument(
+            "--baudrate",
+            type=int,
+            default=115200,
+            help="Скорость порта (по умолчанию 115200).",
+        )
+        target_parser.add_argument(
+            "--timeout",
+            type=float,
+            default=5.0,
+            help="Таймаут ожидания данных в секундах (по умолчанию 5.0).",
+        )
+
+    ref_parser = subparsers.add_parser("set-reference", help="Сделать эталонный снимок.")
+    ref_parser.add_argument("--port", required=True, help="COM-порт камеры (например, COM7).")
+    ref_parser.add_argument(
+        "--output-folder",
+        type=FilePath,
+        default=FilePath("captures"),
+        help="Каталог, куда сохранять снимки (по умолчанию captures).",
+    )
+    ref_parser.add_argument(
+        "--output",
+        type=FilePath,
+        help="Полный путь к файлу эталонного снимка. Если не указан — имя формируется по времени.",
+    )
+    add_serial_common_args(ref_parser)
+
+    test_parser = subparsers.add_parser(
+        "add-test", help="Сделать снимок тестовой платы и сравнить с эталоном."
+    )
+    test_parser.add_argument(
+        "--reference-image",
+        type=FilePath,
+        required=True,
+        help="Путь к эталонному снимку (JPEG, PNG и т.д.).",
+    )
+    test_parser.add_argument(
+        "--test-image",
+        type=FilePath,
+        help="Уже сделанный снимок тестовой платы. Если не указан — снимок будет сделан с камеры.",
+    )
+    test_parser.add_argument("--port", help="COM-порт камеры для тестовой платы.")
+    test_parser.add_argument(
+        "--output-folder",
+        type=FilePath,
+        default=FilePath("captures"),
+        help="Каталог для сохранения нового тестового снимка.",
+    )
+    test_parser.add_argument(
+        "--output",
+        type=FilePath,
+        help="Полный путь к сохраняемому тестовому снимку. По умолчанию генерируется автоматически.",
+    )
+    test_parser.add_argument(
+        "--diff-threshold",
+        type=float,
+        default=0.1,
+        help="Порог для пиксельного сравнения (по умолчанию 0.1).",
+    )
+    test_parser.add_argument(
+        "--grid-threshold",
+        type=float,
+        default=0.13,
+        help="Порог среднего отклонения по сегментам сетки (по умолчанию 0.13).",
+    )
+    test_parser.add_argument(
+        "--grid-size",
+        type=int,
+        default=8,
+        help="Размер сетки для сегментного анализа (по умолчанию 8).",
+    )
+    test_parser.add_argument(
+        "--no-show",
+        action="store_true",
+        help="Не открывать графические окна matplotlib.",
+    )
+    add_serial_common_args(test_parser)
+
+    return parser.parse_args(argv)
+
+
+def set_reference_cmd(args: argparse.Namespace) -> None:
+    target = args.output or default_filename(args.output_folder, "reference")
+    saved = capture_once(args.port, target, args.baudrate, args.timeout)
+    print(f"Эталонный снимок сохранён: {saved}")
+    print("Используйте этот путь в команде add-test через --reference-image.")
+
+
+def add_test_cmd(args: argparse.Namespace) -> None:
+    reference_path = args.reference_image
+    if not reference_path.exists():
+        raise FileNotFoundError(f"Эталонный снимок не найден: {reference_path}")
+
+    if args.test_image:
+        test_path = args.test_image
+        if not test_path.exists():
+            raise FileNotFoundError(f"Тестовый снимок не найден: {test_path}")
     else:
-        print("Не удалось вычислить гомографию")
+        if not args.port:
+            raise SystemExit("Укажите --port или передайте готовый файл через --test-image.")
+        target = args.output or default_filename(args.output_folder, "test")
+        test_path = capture_once(args.port, target, args.baudrate, args.timeout)
+        print(f"Тестовый снимок сохранён: {test_path}")
+
+    print(f"Сравниваю {reference_path} и {test_path}")
+    result = run_comparison_from_paths(
+        reference_path,
+        test_path,
+        diff_threshold=args.diff_threshold,
+        grid_threshold=args.grid_threshold,
+        grid_size=args.grid_size,
+        show_plots=not args.no_show,
+    )
+
+    stats = result.get("stats_pix")
+    if stats:
+        print("\n=== СТАТИСТИКА РАЗЛИЧИЙ ===")
+        print(f"Средняя разница: {stats['mean_diff']:.4f}")
+        print(f"Максимальная разница: {stats['max_diff']:.4f}")
+        print(f"Доля пикселей > {stats['threshold']:.2f}: {stats['high_diff_ratio']*100:.2f}%")
+    else:
+        print("Не удалось вычислить статистику: нет пересечения масок.")
+
+    grid_info = result.get("grid_info")
+    if grid_info and grid_info.get("results"):
+        defect_count = sum(res["is_defect"] for res in grid_info["results"])
+        print("\n=== СТАТИСТИКА ПО СЕТКЕ ===")
+        print(f"Всего сегментов с данными: {len(grid_info['results'])}")
+        print(f"Дефектных сегментов (> {grid_info['threshold']:.2f}): {defect_count}")
+    elif grid_info is None:
+        print("Сравнение по сетке недоступно.")
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_cli_args(argv)
+    try:
+        if args.command == "set-reference":
+            set_reference_cmd(args)
+        elif args.command == "add-test":
+            add_test_cmd(args)
+        else:
+            raise SystemExit(f"Неизвестная команда: {args.command}")
+    except (RuntimeError, TimeoutError, serial.SerialException, FileNotFoundError) as exc:
+        sys.exit(f"Ошибка: {exc}")
 
 
 if __name__ == "__main__":
